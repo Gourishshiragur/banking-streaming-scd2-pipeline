@@ -24,18 +24,18 @@ EVENT_SCHEMA = StructType(
 
 
 def _write_quarantine(df, config: StreamingConfig):
-    if not df.rdd.isEmpty():
+    if df.limit(1).count() > 0:
         df.write.format("delta").mode("append").option("mergeSchema", "true").save(
             str(config.dead_letter_path)
         )
 
 
 def _process_micro_batch(batch_df, batch_id, spark, config):
-    if batch_df.rdd.isEmpty():
+    if batch_df.limit(1).count() == 0:
         return
     valid, quarantined = split_valid_and_quarantined(batch_df, config)
     _write_quarantine(quarantined, config)
-    if valid.rdd.isEmpty():
+    if valid.limit(1).count() == 0:
         logger.warning("micro-batch quarantined; no valid rows", extra={"fields": {"batch_id": batch_id}})
         return
     apply_scd2_batch(valid, batch_id, spark, config)
