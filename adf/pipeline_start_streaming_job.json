@@ -1,0 +1,62 @@
+{
+  "name": "pl_start_and_monitor_streaming_scd2_job",
+  "properties": {
+    "description": "Deployment/promotion pipeline: starts the long-running Databricks streaming job via the Jobs API and polls run health for alerting. Does not use ADF's per-activity retry -- the job's own retry policy (adf/databricks_job_definition.json) owns restart semantics for the continuously running query.",
+    "activities": [
+      {
+        "name": "Start_Streaming_Job_Run",
+        "type": "WebActivity",
+        "typeProperties": {
+          "url": "https://<your-workspace>.azuredatabricks.net/api/2.1/jobs/run-now",
+          "method": "POST",
+          "headers": { "Content-Type": "application/json" },
+          "body": { "job_id": "@pipeline().parameters.databricks_job_id" },
+          "authentication": {
+            "type": "MSI",
+            "resource": "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
+          }
+        }
+      },
+      {
+        "name": "Wait_Before_Health_Poll",
+        "type": "Wait",
+        "dependsOn": [
+          { "activity": "Start_Streaming_Job_Run", "dependencyConditions": ["Succeeded"] }
+        ],
+        "typeProperties": { "waitTimeInSeconds": 300 }
+      },
+      {
+        "name": "Poll_Run_Health",
+        "type": "WebActivity",
+        "dependsOn": [
+          { "activity": "Wait_Before_Health_Poll", "dependencyConditions": ["Succeeded"] }
+        ],
+        "typeProperties": {
+          "url": "@concat('https://<your-workspace>.azuredatabricks.net/api/2.1/jobs/runs/get?run_id=', activity('Start_Streaming_Job_Run').output.run_id)",
+          "method": "GET",
+          "authentication": { "type": "MSI", "resource": "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d" }
+        }
+      },
+      {
+        "name": "Alert_If_Unhealthy",
+        "type": "WebActivity",
+        "dependsOn": [
+          { "activity": "Poll_Run_Health", "dependencyConditions": ["Succeeded"] }
+        ],
+        "typeProperties": {
+          "url": "@pipeline().parameters.alert_webhook_url",
+          "method": "POST",
+          "body": {
+            "pipeline": "pl_start_and_monitor_streaming_scd2_job",
+            "run_state": "@activity('Poll_Run_Health').output.state.life_cycle_state"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "databricks_job_id": { "type": "string" },
+      "alert_webhook_url": { "type": "string" }
+    },
+    "annotations": ["streaming", "scd2", "job-lifecycle"]
+  }
+}

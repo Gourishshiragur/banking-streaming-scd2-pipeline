@@ -1,0 +1,51 @@
+{
+  "name": "job_streaming_scd2_banking_accounts",
+  "tags": {
+    "project": "streaming-scd2-pipeline",
+    "env": "production",
+    "domain": "banking"
+  },
+  "job_clusters": [
+    {
+      "job_cluster_key": "scd2_streaming_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "Standard_DS3_v2",
+        "num_workers": 2,
+        "spark_conf": {
+          "spark.sql.shuffle.partitions": "8",
+          "spark.databricks.delta.optimizeWrite.enabled": "true"
+        }
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "run_streaming_scd2_banking",
+      "job_cluster_key": "scd2_streaming_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/production/streaming-scd2-pipeline/notebooks/01_streaming_scd2_job",
+        "base_parameters": {
+          "stream_source_path": "/Volumes/main/default/streaming_scd2/landing",
+          "target_table_path": "/Volumes/main/default/streaming_scd2/account_state_scd2",
+          "event_ledger_path": "/Volumes/main/default/streaming_scd2/account_event_ledger",
+          "checkpoint_path": "/Volumes/main/default/streaming_scd2/checkpoint",
+          "dead_letter_path": "/Volumes/main/default/streaming_scd2/quarantine",
+          "watermark_duration": "10 minutes"
+        }
+      },
+      "max_retries": -1,
+      "min_retry_interval_millis": 30000,
+      "retry_on_timeout": true,
+      "timeout_seconds": 0
+    }
+  ],
+  "notification_settings": {
+    "no_alert_for_skipped_runs": false
+  },
+  "email_notifications": {
+    "on_failure": [
+      "data-eng-oncall@example.com"
+    ]
+  }
+}
