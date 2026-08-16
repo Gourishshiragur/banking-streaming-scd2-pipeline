@@ -99,10 +99,10 @@ def apply_scd2_batch(
     config: StreamingConfig,
 ):
     """Process one Structured Streaming micro-batch idempotently."""
-    incoming = micro_batch_df.dropDuplicates(["event_id"]).cache()
+    incoming = micro_batch_df.dropDuplicates(["event_id"])
     incoming_count = incoming.count()
     if incoming_count == 0:
-        incoming.unpersist()
+        incoming
         return
 
     stage_start = time.perf_counter()
@@ -142,7 +142,7 @@ def apply_scd2_batch(
         spark.read.format("delta").load(str(config.event_ledger_path))
         .filter(F.col(config.entity_key).isin(impacted_accounts))
     )
-    rebuilt = _build_scd2_history(ledger_events, config).cache()
+    rebuilt = _build_scd2_history(ledger_events, config)
 
     logger.info(
         "scd2 stage timing",
@@ -231,5 +231,5 @@ def apply_scd2_batch(
         },
     )
 
-    rebuilt.unpersist()
-    incoming.unpersist()
+    rebuilt
+    incoming
