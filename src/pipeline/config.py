@@ -21,7 +21,7 @@ class StreamingConfig:
     tracked_attribute_cols: tuple[str, ...] = ("account_status", "account_tier", "branch_region")
 
     def __post_init__(self):
-        if os.getenv("DATABRICKS_RUNTIME_VERSION"):
+        if os.getenv("DATABRICKS_RUNTIME_VERSION") and str(self.base_path) == "data":
             self.base_path = Path(
                 os.getenv(
                     "STREAMING_BASE_PATH",
