@@ -45,8 +45,6 @@ class StreamingAudit:
                 os.fsync(handle.fileno())
             with path.open("a", encoding="utf-8") as target, open(tmp, "r", encoding="utf-8") as source:
                 target.write(source.read())
-                target.flush()
-                os.fsync(target.fileno())
         finally:
             try:
                 os.unlink(tmp)
