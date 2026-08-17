@@ -35,7 +35,7 @@ class StreamingConfig:
         self.checkpoint_path = self.base_path / "checkpoints" / "account_scd2_stream"
         self.target_table_path = self.base_path / "account_state_scd2"
         self.event_ledger_path = self.base_path / "account_event_ledger"
-        self.audit_path = self.base_path / "streaming_audit.jsonl"
+        self.audit_path = self.base_path / "streaming_audit"
         self.dead_letter_path = self.base_path / "dead_letter"
         if self.create_local_dirs and not os.getenv("DATABRICKS_RUNTIME_VERSION"):
             for p in [self.stream_source_path, self.checkpoint_path.parent, self.target_table_path.parent, self.dead_letter_path]:

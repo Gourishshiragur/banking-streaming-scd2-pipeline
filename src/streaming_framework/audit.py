@@ -1,12 +1,12 @@
 """Low-overhead streaming audit writer.
 
-Unlike the old batch framework, this writer does not create Spark tables or
-launch Spark jobs. One completed micro-batch produces one atomic JSON record.
-The same file format can be shipped to a centralized observability sink later.
+One completed micro-batch produces one JSON audit record.
+Audit records are stored as individual JSON files so the writer works
+with Databricks Unity Catalog Volumes without relying on append/seek
+semantics of a single file.
 """
+
 import json
-import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,11 +14,18 @@ from typing import Any
 from .context import StreamingBatchContext
 from .metrics import BatchMetrics
 
+
 class StreamingAudit:
     def __init__(self, context: StreamingBatchContext):
         self.context = context
 
-    def record(self, metrics: BatchMetrics, *, duration_seconds: float) -> dict[str, Any]:
+    def record(
+        self,
+        metrics: BatchMetrics,
+        *,
+        duration_seconds: float,
+    ) -> dict[str, Any]:
+
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "pipeline_name": self.context.pipeline_name,
@@ -35,19 +42,16 @@ class StreamingAudit:
             "checkpoint_path": str(self.context.checkpoint_path),
             "target_path": str(self.context.target_path),
         }
-        path = Path(self.context.audit_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=".audit-", suffix=".tmp", dir=str(path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(record) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            with path.open("a", encoding="utf-8") as target, open(tmp, "r", encoding="utf-8") as source:
-                target.write(source.read())
-        finally:
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
+
+        audit_dir = Path(self.context.audit_path)
+        audit_dir.mkdir(parents=True, exist_ok=True)
+
+        audit_file = audit_dir / f"batch_{self.context.batch_id}.json"
+
+        # Write one independent file per completed micro-batch.
+        audit_file.write_text(
+            json.dumps(record) + "\n",
+            encoding="utf-8",
+        )
+
         return record
