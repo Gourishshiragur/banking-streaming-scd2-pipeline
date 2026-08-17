@@ -21,12 +21,21 @@ class StreamingConfig:
     tracked_attribute_cols: tuple[str, ...] = ("account_status", "account_tier", "branch_region")
 
     def __post_init__(self):
-        self.base_path = Path(self.base_path)
+        if os.getenv("DATABRICKS_RUNTIME_VERSION"):
+            self.base_path = Path(
+                os.getenv(
+                    "STREAMING_BASE_PATH",
+                    "/Volumes/workspace/default/streaming_scd2",
+                )
+            )
+        else:
+            self.base_path = Path(self.base_path)
+
         self.stream_source_path = self.base_path / "stream_source"
         self.checkpoint_path = self.base_path / "checkpoints" / "account_scd2_stream"
-        self.target_table_path = self.base_path / "delta" / "account_state_scd2"
-        self.event_ledger_path = self.base_path / "delta" / "account_event_ledger"
-        self.audit_path = self.base_path / "delta" / "streaming_audit.jsonl"
+        self.target_table_path = self.base_path / "account_state_scd2"
+        self.event_ledger_path = self.base_path / "account_event_ledger"
+        self.audit_path = self.base_path / "streaming_audit.jsonl"
         self.dead_letter_path = self.base_path / "dead_letter"
         if self.create_local_dirs and not os.getenv("DATABRICKS_RUNTIME_VERSION"):
             for p in [self.stream_source_path, self.checkpoint_path.parent, self.target_table_path.parent, self.dead_letter_path]:

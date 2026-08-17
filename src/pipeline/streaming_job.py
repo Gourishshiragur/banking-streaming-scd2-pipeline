@@ -1,4 +1,5 @@
 """Structured Streaming entrypoint using the streaming-native framework."""
+import os
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StringType, StructField, StructType, TimestampType
 
@@ -37,11 +38,15 @@ def build_and_start_stream(spark: SparkSession, config: StreamingConfig):
         .json(str(config.stream_source_path))
     )
     stream = raw.withWatermark(config.event_time_col, config.watermark_duration).dropDuplicates(["event_id"])
-    query = (
-        stream.writeStream.foreachBatch(lambda df, bid: _process_micro_batch(df, bid, spark, config))
+    writer = (
+        stream.writeStream
+        .foreachBatch(lambda df, bid: _process_micro_batch(df, bid, spark, config))
         .option("checkpointLocation", checkpoint)
-        .trigger(processingTime=config.trigger_interval)
-        .start()
     )
+
+    if os.getenv("DATABRICKS_RUNTIME_VERSION"):
+        query = writer.trigger(availableNow=True).start()
+    else:
+        query = writer.trigger(processingTime=config.trigger_interval).start()
     logger.info("streaming query started", extra={"fields": {"checkpoint": checkpoint, "watermark": config.watermark_duration}})
     return query
