@@ -12,7 +12,6 @@ The implementation keeps replay idempotency and late-arriving event ordering.
 import time
 
 from delta.tables import DeltaTable
-from pyspark import StorageLevel
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
@@ -86,9 +85,7 @@ def _build_scd2_history(events: DataFrame, config: StreamingConfig) -> DataFrame
 
 def apply_scd2_batch(micro_batch_df, batch_id, spark, config):
     started = time.perf_counter()
-    incoming = micro_batch_df.dropDuplicates(["event_id"]).persist(
-        StorageLevel.MEMORY_AND_DISK
-    )
+    incoming = micro_batch_df.dropDuplicates(["event_id"])
     existing = None
     new_events = None
     rebuilt = None
@@ -119,7 +116,6 @@ def apply_scd2_batch(micro_batch_df, batch_id, spark, config):
                     "account_tier",
                     "branch_region",
                 )
-                .persist(StorageLevel.MEMORY_AND_DISK)
             )
             existing.count()
             seen = existing.select(
@@ -141,9 +137,7 @@ def apply_scd2_batch(micro_batch_df, batch_id, spark, config):
                 "account_status string, account_tier string, branch_region string",
             )
 
-        new_events = incoming.join(seen, "event_id", "left_anti").persist(
-            StorageLevel.MEMORY_AND_DISK
-        )
+        new_events = incoming.join(seen, "event_id", "left_anti")
         new_count = new_events.count()
 
         if new_count == 0:
@@ -164,9 +158,7 @@ def apply_scd2_batch(micro_batch_df, batch_id, spark, config):
             )
         )
 
-        rebuilt = _build_scd2_history(all_events, config).persist(
-            StorageLevel.MEMORY_AND_DISK
-        )
+        rebuilt = _build_scd2_history(all_events, config)
         rebuilt_count = rebuilt.count()
 
         # Fast path: an empty target has no prior versions to replace.
@@ -228,10 +220,4 @@ def apply_scd2_batch(micro_batch_df, batch_id, spark, config):
             }},
         )
     finally:
-        if rebuilt is not None:
-            rebuilt.unpersist()
-        if new_events is not None:
-            new_events.unpersist()
-        if existing is not None:
-            existing.unpersist()
-        incoming.unpersist()
+        pass
