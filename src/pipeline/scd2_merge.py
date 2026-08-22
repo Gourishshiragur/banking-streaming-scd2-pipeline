@@ -45,6 +45,7 @@ def _build_scd2_history(events: DataFrame, config: StreamingConfig) -> DataFrame
 
     changed = x.filter(
         F.col("previous_status").isNull()
+        | (F.col("operation") == "DELETE")
         | ~F.col("account_status").eqNullSafe(F.col("previous_status"))
         | ~F.col("account_tier").eqNullSafe(F.col("previous_tier"))
         | ~F.col("branch_region").eqNullSafe(F.col("previous_region"))
@@ -59,7 +60,11 @@ def _build_scd2_history(events: DataFrame, config: StreamingConfig) -> DataFrame
         changed
         .withColumn("effective_from", F.col(config.event_time_col))
         .withColumn("effective_to", F.lead(config.event_time_col).over(vw))
-        .withColumn("is_current", F.col("effective_to").isNull())
+        .withColumn(
+            "is_current",
+            F.col("effective_to").isNull()
+            & (F.col("operation") != "DELETE"),
+        )
         .withColumn(
             "version_id",
             F.sha2(
@@ -68,6 +73,7 @@ def _build_scd2_history(events: DataFrame, config: StreamingConfig) -> DataFrame
             ),
         )
         .withColumnRenamed("event_id", "source_event_id")
+        .filter(F.col("operation") != "DELETE")
         .select(
             "version_id",
             config.entity_key,
@@ -112,6 +118,7 @@ def apply_scd2_batch(micro_batch_df, batch_id, spark, config):
                     "source_event_id",
                     config.entity_key,
                     config.event_time_col,
+                    F.lit("UPDATE").alias("operation"),
                     "account_status",
                     "account_tier",
                     "branch_region",
@@ -125,6 +132,7 @@ def apply_scd2_batch(micro_batch_df, batch_id, spark, config):
                 F.col("source_event_id").alias("event_id"),
                 config.entity_key,
                 config.event_time_col,
+                "operation",
                 "account_status",
                 "account_tier",
                 "branch_region",
@@ -134,10 +142,21 @@ def apply_scd2_batch(micro_batch_df, batch_id, spark, config):
             prior = spark.createDataFrame(
                 [],
                 "event_id string, account_id string, event_time timestamp, "
-                "account_status string, account_tier string, branch_region string",
+                "operation string, account_status string, account_tier string, "
+                "branch_region string",
             )
 
         new_events = incoming.join(seen, "event_id", "left_anti")
+
+        # Backward compatibility for the core SCD2 API: callers that
+        # provide the legacy event shape do not have an operation column.
+        # CDC-aware callers provide INSERT/UPDATE/DELETE explicitly.
+        if "operation" not in new_events.columns:
+            new_events = new_events.withColumn(
+                "operation",
+                F.lit("UPDATE"),
+            )
+
         new_count = new_events.count()
 
         if new_count == 0:
@@ -152,6 +171,7 @@ def apply_scd2_batch(micro_batch_df, batch_id, spark, config):
                 "event_id",
                 config.entity_key,
                 config.event_time_col,
+                "operation",
                 "account_status",
                 "account_tier",
                 "branch_region",

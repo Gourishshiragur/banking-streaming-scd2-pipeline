@@ -1,33 +1,33 @@
 """Structured Streaming entrypoint using the streaming-native framework."""
 import os
 from pyspark.sql import SparkSession
-from pyspark.sql.types import StringType, StructField, StructType, TimestampType
 
 from pipeline.config import StreamingConfig
 from pipeline.logger import get_logger
 from pipeline.schema_evolution import split_valid_and_quarantined
+from cdc.event_contract import CDC_EVENT_SCHEMA, validate_cdc_events, quarantine_cdc_events
 from pipeline.scd2_merge import apply_scd2_batch
 from streaming_framework.checkpoint import validate_checkpoint_path
 
 logger = get_logger(__name__)
 
-EVENT_SCHEMA = StructType([
-    StructField("event_id", StringType(), False),
-    StructField("account_id", StringType(), False),
-    StructField("event_time", TimestampType(), False),
-    StructField("account_status", StringType(), True),
-    StructField("account_tier", StringType(), True),
-    StructField("branch_region", StringType(), True),
-    StructField("customer_segment", StringType(), True),
-])
+EVENT_SCHEMA = CDC_EVENT_SCHEMA
 
 def _write_quarantine(df, config: StreamingConfig):
     if not df.isEmpty():
         df.write.format("delta").mode("append").option("mergeSchema", "true").save(str(config.dead_letter_path))
 
 def _process_micro_batch(batch_df, batch_id, spark, config):
-    valid, quarantined = split_valid_and_quarantined(batch_df, config)
+    # First enforce the canonical CDC event contract.
+    cdc_valid = validate_cdc_events(batch_df)
+    cdc_quarantined = quarantine_cdc_events(batch_df)
+
+    _write_quarantine(cdc_quarantined, config)
+
+    # Apply existing schema-evolution validation to structurally valid CDC.
+    valid, quarantined = split_valid_and_quarantined(cdc_valid, config)
     _write_quarantine(quarantined, config)
+
     apply_scd2_batch(valid, batch_id, spark, config)
 
 def build_and_start_stream(spark: SparkSession, config: StreamingConfig):
