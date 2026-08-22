@@ -1,9 +1,13 @@
-"""Idempotent SCD Type 2 processing for banking account events.
+"""Streaming-native SCD Type 2 writer.
 
-The event ledger is the durable source of truth for valid events.  Each
-foreachBatch call merges new event_ids into that ledger, then deterministically
-rebuilds the SCD2 history for only the impacted accounts.  This makes replay
-safe even when a Spark checkpoint is replayed after a crash.
+The legacy incremental-batch audit framework is deliberately not used here.
+The hot path performs:
+  1. one target slice read,
+  2. one deterministic SCD2 rebuild,
+  3. one Delta transaction for impacted accounts,
+  4. one non-Spark operational audit append.
+
+The implementation keeps replay idempotency and late-arriving event ordering.
 """
 import time
 
@@ -12,71 +16,64 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
-from pipeline.audit import record_batch_audit
 from pipeline.config import StreamingConfig
+from streaming_framework.audit import StreamingAudit
+from streaming_framework.context import StreamingBatchContext
+from streaming_framework.metrics import BatchMetrics
 from pipeline.logger import get_logger
 
 logger = get_logger(__name__)
 
 
-def _ensure_delta(path, df: DataFrame):
+def _ensure_delta(path, df):
     if not DeltaTable.isDeltaTable(df.sparkSession, str(path)):
         df.limit(0).write.format("delta").save(str(path))
 
 
-def _merge_event_ledger(events: DataFrame, spark: SparkSession, config: StreamingConfig):
-    _ensure_delta(config.event_ledger_path, events)
-
-    existing = (
-        spark.read.format("delta")
-        .load(str(config.event_ledger_path))
-        .select("event_id")
-    )
-
-    new_events = events.join(
-        existing,
-        on="event_id",
-        how="left_anti",
-    )
-
-    new_events.write.format("delta").mode("append").option(
-        "mergeSchema", "true"
-    ).save(str(config.event_ledger_path))
-
-
 def _build_scd2_history(events: DataFrame, config: StreamingConfig) -> DataFrame:
-    order_window = Window.partitionBy(config.entity_key).orderBy(
-        F.col(config.event_time_col).asc(), F.col("event_id").asc()
+    w = Window.partitionBy(config.entity_key).orderBy(
+        F.col(config.event_time_col).asc(),
+        F.col("event_id").asc(),
     )
 
-    with_previous = events.withColumn("previous_status", F.lag("account_status").over(order_window)) \
-        .withColumn("previous_tier", F.lag("account_tier").over(order_window)) \
-        .withColumn("previous_region", F.lag("branch_region").over(order_window))
+    x = (
+        events
+        .withColumn("previous_status", F.lag("account_status").over(w))
+        .withColumn("previous_tier", F.lag("account_tier").over(w))
+        .withColumn("previous_region", F.lag("branch_region").over(w))
+    )
 
-    is_change = (
+    changed = x.filter(
         F.col("previous_status").isNull()
+        | (F.col("operation") == "DELETE")
         | ~F.col("account_status").eqNullSafe(F.col("previous_status"))
         | ~F.col("account_tier").eqNullSafe(F.col("previous_tier"))
         | ~F.col("branch_region").eqNullSafe(F.col("previous_region"))
+    ).drop("previous_status", "previous_tier", "previous_region")
+
+    vw = Window.partitionBy(config.entity_key).orderBy(
+        F.col(config.event_time_col).asc(),
+        F.col("event_id").asc(),
     )
 
-    changes = with_previous.filter(is_change).drop(
-        "previous_status", "previous_tier", "previous_region"
-    )
-
-    version_window = Window.partitionBy(config.entity_key).orderBy(
-        F.col(config.event_time_col).asc(), F.col("event_id").asc()
-    )
     return (
-        changes
+        changed
         .withColumn("effective_from", F.col(config.event_time_col))
-        .withColumn("effective_to", F.lead(config.event_time_col).over(version_window))
-        .withColumn("is_current", F.col("effective_to").isNull())
+        .withColumn("effective_to", F.lead(config.event_time_col).over(vw))
+        .withColumn(
+            "is_current",
+            F.col("effective_to").isNull()
+            & (F.col("operation") != "DELETE"),
+        )
         .withColumn(
             "version_id",
-            F.sha2(F.concat_ws("||", F.col(config.entity_key), F.col("event_id")), 256),
+            F.sha2(
+                F.concat_ws("||", F.col(config.entity_key), F.col("event_id")),
+                256,
+            ),
         )
         .withColumnRenamed("event_id", "source_event_id")
+        .filter(F.col("operation") != "DELETE")
         .select(
             "version_id",
             config.entity_key,
@@ -92,144 +89,154 @@ def _build_scd2_history(events: DataFrame, config: StreamingConfig) -> DataFrame
     )
 
 
-def apply_scd2_batch(
-    micro_batch_df: DataFrame,
-    batch_id: int,
-    spark: SparkSession,
-    config: StreamingConfig,
-):
-    """Process one Structured Streaming micro-batch idempotently."""
-    incoming = micro_batch_df.dropDuplicates(["event_id"]).cache()
-    incoming_count = incoming.count()
-    if incoming_count == 0:
-        incoming.unpersist()
-        return
+def apply_scd2_batch(micro_batch_df, batch_id, spark, config):
+    started = time.perf_counter()
+    incoming = micro_batch_df.dropDuplicates(["event_id"])
+    existing = None
+    new_events = None
+    rebuilt = None
 
-    stage_start = time.perf_counter()
-    _merge_event_ledger(incoming, spark, config)
-    logger.info(
-        "scd2 stage timing",
-        extra={
-            "fields": {
-                "stage": "event_ledger_merge",
-                "duration_seconds": round(time.perf_counter() - stage_start, 3),
-                "batch_id": batch_id,
-            }
-        },
-    )
+    try:
+        incoming_count = incoming.count()
+        if incoming_count == 0:
+            return
 
-    stage_start = time.perf_counter()
-    impacted_accounts = [
-        r[config.entity_key]
-        for r in incoming.select(config.entity_key).distinct().collect()
-    ]
-    logger.info(
-        "scd2 stage timing",
-        extra={
-            "fields": {
-                "stage": "impacted_account_collect",
-                "duration_seconds": round(time.perf_counter() - stage_start, 3),
-                "batch_id": batch_id,
-            }
-        },
-    )
-    if not impacted_accounts:
-        return
+        impacted = [
+            r[config.entity_key]
+            for r in incoming.select(config.entity_key).distinct().collect()
+        ]
+        if not impacted:
+            return
 
-    stage_start = time.perf_counter()
+        # One target scan. The selected columns are exactly those needed by SCD2.
+        if DeltaTable.isDeltaTable(spark, str(config.target_table_path)):
+            existing = (
+                spark.read.format("delta")
+                .load(str(config.target_table_path))
+                .where(F.col(config.entity_key).isin(impacted))
+                .select(
+                    "source_event_id",
+                    config.entity_key,
+                    config.event_time_col,
+                    F.lit("UPDATE").alias("operation"),
+                    "account_status",
+                    "account_tier",
+                    "branch_region",
+                )
+            )
+            existing.count()
+            seen = existing.select(
+                F.col("source_event_id").alias("event_id")
+            )
+            prior = existing.select(
+                F.col("source_event_id").alias("event_id"),
+                config.entity_key,
+                config.event_time_col,
+                "operation",
+                "account_status",
+                "account_tier",
+                "branch_region",
+            )
+        else:
+            seen = spark.createDataFrame([], "event_id string")
+            prior = spark.createDataFrame(
+                [],
+                "event_id string, account_id string, event_time timestamp, "
+                "operation string, account_status string, account_tier string, "
+                "branch_region string",
+            )
 
-    ledger_events = (
-        spark.read.format("delta").load(str(config.event_ledger_path))
-        .filter(F.col(config.entity_key).isin(impacted_accounts))
-    )
-    rebuilt = _build_scd2_history(ledger_events, config).cache()
+        new_events = incoming.join(seen, "event_id", "left_anti")
 
-    logger.info(
-        "scd2 stage timing",
-        extra={
-            "fields": {
-                "stage": "ledger_read_and_scd2_rebuild",
-                "duration_seconds": round(time.perf_counter() - stage_start, 3),
-                "batch_id": batch_id,
-            }
-        },
-    )
+        # Backward compatibility for the core SCD2 API: callers that
+        # provide the legacy event shape do not have an operation column.
+        # CDC-aware callers provide INSERT/UPDATE/DELETE explicitly.
+        if "operation" not in new_events.columns:
+            new_events = new_events.withColumn(
+                "operation",
+                F.lit("UPDATE"),
+            )
 
-    _ensure_delta(config.target_table_path, rebuilt)
-    target = DeltaTable.forPath(spark, str(config.target_table_path))
+        new_count = new_events.count()
 
-    # Replace only impacted account histories.  The rebuild is deterministic,
-    # so replaying the same micro-batch produces the exact same rows.
-    stage_start = time.perf_counter()
-    target.delete(F.col(config.entity_key).isin(impacted_accounts))
-    logger.info(
-        "scd2 stage timing",
-        extra={
-            "fields": {
-                "stage": "target_delete",
-                "duration_seconds": round(time.perf_counter() - stage_start, 3),
-                "batch_id": batch_id,
-            }
-        },
-    )
-    stage_start = time.perf_counter()
-    rebuilt.write.format("delta").mode("append").save(
-        str(config.target_table_path)
-    )
-    logger.info(
-        "scd2 stage timing",
-        extra={
-            "fields": {
-                "stage": "target_append",
-                "duration_seconds": round(time.perf_counter() - stage_start, 3),
-                "batch_id": batch_id,
-            }
-        },
-    )
+        if new_count == 0:
+            logger.info(
+                "streaming SCD2 replay skipped",
+                extra={"fields": {"spark_batch_id": batch_id, "incoming_rows": incoming_count}},
+            )
+            return
 
-    stage_start = time.perf_counter()
+        all_events = prior.unionByName(
+            new_events.select(
+                "event_id",
+                config.entity_key,
+                config.event_time_col,
+                "operation",
+                "account_status",
+                "account_tier",
+                "branch_region",
+            )
+        )
 
-    metrics = rebuilt.agg(
-        F.count("*").alias("history_rows"),
-        F.sum(F.when(F.col("is_current"), 1).otherwise(0)).alias("current_rows"),
-    ).first()
+        rebuilt = _build_scd2_history(all_events, config)
 
-    history_rows = metrics["history_rows"]
-    current_rows = metrics["current_rows"] or 0
-    impacted_count = len(impacted_accounts)
+        # Fast path: an empty target has no prior versions to replace.
+        # Append is materially cheaper than replaceWhere on local Delta.
+        target_exists = DeltaTable.isDeltaTable(spark, str(config.target_table_path))
+        if not target_exists:
+            (
+                rebuilt.write.format("delta")
+                .mode("append")
+                .save(str(config.target_table_path))
+            )
+        else:
+            # Existing/late-arriving accounts require an atomic targeted
+            # replacement to preserve effective_from/effective_to semantics.
+            predicate = (
+                f"{config.entity_key} IN "
+                f"({', '.join(repr(str(a)) for a in impacted)})"
+            )
+            (
+                rebuilt.write.format("delta")
+                .mode("overwrite")
+                .option("replaceWhere", predicate)
+                .save(str(config.target_table_path))
+            )
 
-    record_batch_audit(
-        spark,
-        config,
-        batch_id,
-        incoming_count,
-        impacted_count,
-        history_rows,
-        current_rows,
-    )
+        metrics = rebuilt.agg(
+            F.count("*").alias("history_rows"),
+            F.sum(F.when(F.col("is_current"), 1).otherwise(0)).alias("current_rows"),
+        ).first()
+        rebuilt_count = int(metrics["history_rows"])
+        current_rows = int(metrics["current_rows"] or 0)
 
-    logger.info(
-        "scd2 stage timing",
-        extra={
-            "fields": {
-                "stage": "metrics_and_audit",
-                "duration_seconds": round(time.perf_counter() - stage_start, 3),
-                "batch_id": batch_id,
-            }
-        },
-    )
+        context = StreamingBatchContext(
+            pipeline_name="banking_scd2_streaming",
+            batch_id=int(batch_id),
+            checkpoint_path=config.checkpoint_path,
+            target_path=config.target_table_path,
+            audit_path=config.audit_path,
+        )
+        audit_metrics = BatchMetrics(
+            input_rows=incoming_count,
+            new_rows=new_count,
+            impacted_accounts=len(impacted),
+            history_rows=rebuilt_count,
+            current_rows=current_rows,
+        )
+        StreamingAudit(context).record(
+            audit_metrics,
+            duration_seconds=time.perf_counter() - started,
+        )
 
-    logger.info(
-        "streaming SCD2 batch committed",
-        extra={
-            "fields": {
+        logger.info(
+            "streaming SCD2 batch committed",
+            extra={"fields": {
                 "spark_batch_id": batch_id,
                 "incoming_rows": incoming_count,
-                "impacted_accounts": impacted_count,
-                "history_rows_rebuilt": history_rows,
-            }
-        },
-    )
-
-    rebuilt.unpersist()
-    incoming.unpersist()
+                "impacted_accounts": len(impacted),
+                "history_rows_rebuilt": rebuilt_count,
+            }},
+        )
+    finally:
+        pass

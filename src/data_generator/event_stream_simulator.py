@@ -16,13 +16,23 @@ ACCOUNT_POOL = [f"ACC-{i:05d}" for i in range(1, 51)]
 def make_event(late: bool):
     now = datetime.now(timezone.utc)
     event_time = now - timedelta(minutes=random.randint(1, 8)) if late else now
+
+    operation = random.choices(
+        ["INSERT", "UPDATE", "DELETE"],
+        weights=[0.20, 0.70, 0.10],
+        k=1,
+    )[0]
+
     return {
         "event_id": str(uuid.uuid4()),
         "account_id": random.choice(ACCOUNT_POOL),
+        "operation": operation,
         "event_time": event_time.isoformat(),
         "account_status": random.choice(STATUSES),
         "account_tier": random.choice(TIERS),
         "branch_region": random.choice(REGIONS),
+        "source": "debezium",
+        "schema_version": "1",
     }
 
 

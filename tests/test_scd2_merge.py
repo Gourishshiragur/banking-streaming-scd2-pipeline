@@ -115,3 +115,39 @@ def test_duplicate_replay_is_idempotent(spark, config):
     result = spark.read.format("delta").load(str(config.target_table_path)).filter("account_id = 'ACC-00005'").collect()
     assert len(result) == 2
     assert sum(1 for r in result if r["is_current"]) == 1
+
+def test_delete_event_closes_current_scd2_version(spark, config):
+    t0 = datetime(2026, 1, 1, 10, 0, 0)
+    t1 = t0 + timedelta(minutes=5)
+
+    apply_scd2_batch(_events(spark, [{
+        "event_id": "e-delete-1",
+        "account_id": "ACC-00006",
+        "event_time": t0,
+        "operation": "INSERT",
+        "account_status": "ACTIVE",
+        "account_tier": "STANDARD",
+        "branch_region": "SOUTH",
+    }]), 0, spark, config)
+
+    apply_scd2_batch(_events(spark, [{
+        "event_id": "e-delete-2",
+        "account_id": "ACC-00006",
+        "event_time": t1,
+        "operation": "DELETE",
+        "account_status": "ACTIVE",
+        "account_tier": "STANDARD",
+        "branch_region": "SOUTH",
+    }]), 1, spark, config)
+
+    result = (
+        spark.read.format("delta")
+        .load(str(config.target_table_path))
+        .filter("account_id = 'ACC-00006'")
+        .orderBy("effective_from")
+        .collect()
+    )
+
+    assert len(result) == 1
+    assert result[0]["is_current"] is False
+    assert result[0]["effective_to"] == t1
