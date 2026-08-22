@@ -159,7 +159,6 @@ def apply_scd2_batch(micro_batch_df, batch_id, spark, config):
         )
 
         rebuilt = _build_scd2_history(all_events, config)
-        rebuilt_count = rebuilt.count()
 
         # Fast path: an empty target has no prior versions to replace.
         # Append is materially cheaper than replaceWhere on local Delta.
