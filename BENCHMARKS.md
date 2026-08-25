@@ -99,6 +99,29 @@ Mean ≈ 9.05s, range 7.93s-11.46s. All 5 batches: zero data-quality rejections
 (`dead_letter` empty), correct SCD2 output (10/10 accounts, exactly 1 current row
 each).
 
+### Current Databricks validation run
+
+A fresh controlled validation was run on Databricks Free Edition / Serverless with
+`spark.sql.shuffle.partitions=4`, a fresh checkpoint, and a fresh 20-event input
+file. The operational audit recorded:
+
+| Metric | Result |
+|---|---:|
+| Input events | 20 |
+| New events | 20 |
+| Impacted accounts | 20 |
+| History rows | 20 |
+| Current rows | 20 |
+| Status | SUCCESS |
+| SCD2 processing time | 9.272s |
+
+The corresponding validation produced 40 total target rows and 40 current rows after
+the earlier 20-account validation run plus this second run using 20 new account IDs.
+Quarantine remained empty.
+A separate initial validation with `spark.sql.shuffle.partitions=auto` measured
+47.121s. That result is retained as an observed configuration-specific run and is
+not combined with the controlled `shuffle.partitions=4` benchmark.
+
 **Known artifact, not a production number:** repeatedly calling `.start()` on the same
 checkpoint within one interactive test session (as opposed to a job that starts once
 and runs continuously, or is triggered once per schedule) adds session/query
