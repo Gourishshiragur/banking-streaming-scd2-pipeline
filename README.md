@@ -1,23 +1,25 @@
-# Real-Time Banking Account Streaming Pipeline — SCD Type 2
+# Real-Time Banking Account Streaming Pipeline: SCD Type 2
 
-A production-style **Spark Structured Streaming** pipeline for banking/fintech account-state tracking. Continuous account events are processed as Spark micro-batches, protected by an event-time watermark and checkpoint recovery, and maintained as effective-dated SCD Type 2 history in Delta Lake.
+A reference implementation of a Spark Structured Streaming pipeline that tracks banking account state changes as effective-dated SCD Type 2 history in Delta Lake. It runs locally for development and on Azure Databricks (serverless, Unity Catalog Volumes) for deployment.
 
-This project extends the reusable operational patterns from the companion Incremental Batch and Micro-Batch projects into a true streaming execution model rather than duplicating their batch runners.
+Events arrive as JSON files and are processed as micro-batches. Each batch is validated against a CDC event contract, bad rows are quarantined, and the history of every affected account is rebuilt deterministically and written to the SCD2 target in one Delta transaction.
+
+> **Status:** working reference project. Performance figures below are measured; the [Known limitations](#known-limitations) section lists what the current design does not yet guarantee.
 
 ## Business use case
 
-A banking platform receives continuous customer-account state changes:
+A banking platform receives a continuous stream of account-state changes:
 
-```text
-account_id | account_status | account_tier | branch_region
-ACC-00001  | ACTIVE         | STANDARD    | SOUTH
-ACC-00001  | SUSPENDED      | STANDARD    | SOUTH
-ACC-00001  | ACTIVE         | PREMIUM     | SOUTH
+```
+event_id | account_id | operation | account_status | account_tier | branch_region
+e1       | ACC-00001  | INSERT    | ACTIVE         | STANDARD     | SOUTH
+e2       | ACC-00001  | UPDATE    | SUSPENDED      | STANDARD     | SOUTH
+e3       | ACC-00001  | UPDATE    | ACTIVE         | PREMIUM      | SOUTH
 ```
 
-SCD Type 2 preserves the complete account-state history:
+SCD Type 2 keeps the full history of each account:
 
-```text
+```
 account_id | status    | tier     | effective_from | effective_to | is_current
 ACC-00001  | ACTIVE    | STANDARD | 10:00          | 10:05        | false
 ACC-00001  | SUSPENDED | STANDARD | 10:05          | 10:12        | false
@@ -26,145 +28,82 @@ ACC-00001  | ACTIVE    | PREMIUM  | 10:12          | null         | true
 
 ## Architecture
 
-```text
-             Banking account events
-                       │
-                       ▼
-              JSON/file event source
-                       │
-                       ▼
-          Spark Structured Streaming
-                       │
-          ┌────────────┼────────────┐
-          │            │            │
-      watermark    checkpoint    dedup
-          │            │            │
-          └────────────┼────────────┘
-                       ▼
-                 DQ / quarantine
-                       │
-                       ▼
-                     Bronze
-                       │
-                       ▼
-                 foreachBatch
-                       │
-                       ▼
-               durable event ledger
-                       │
-                       ▼
-               deterministic SCD2
-                       │
-                       ▼
-             Delta account history
-                       │
-                       ▼
-             audit / reconciliation
+```
+  JSON event files (landing)
+            |
+            v
+  Structured Streaming readStream (CDC_EVENT_SCHEMA, maxFilesPerTrigger)
+            |
+            v
+  withWatermark(event_time) + dropDuplicates(event_id)
+            |
+            v
+        foreachBatch
+            |
+   +--------+-------------------------------+
+   |                                        |
+   v                                        v
+ CDC contract + schema guard         valid events
+   |                                        |
+   v                                        v
+ quarantine (Delta)               apply_scd2_batch
+                                            |
+                          +-----------------+------------------+
+                          |                 |                  |
+                    read target slice   rebuild history   atomic write
+                    for impacted        (window functions) (append or
+                    accounts                               replaceWhere)
+                                            |
+                                            v
+                                  operational audit append
 ```
 
-## Resume-claim acceptance criteria
+## What happens in each micro-batch
 
-The project is deliberately built around measurable evidence for the intended resume bullets.
+1. **Validate.** `validate_cdc_events` / `quarantine_cdc_events` (in `cdc/event_contract.py`) enforce the canonical CDC contract, including `operation` in `INSERT | UPDATE | DELETE`. Rows that fail go to the quarantine Delta table.
+2. **Schema guard.** `split_valid_and_quarantined` checks critical column types and quarantines on incompatible type drift.
+3. **De-duplicate.** The batch is de-duplicated on `event_id`.
+4. **Find impacted accounts.** The distinct `account_id` values in the batch.
+5. **Read prior state.** Existing history rows for the impacted accounts are read from the SCD2 target. Events whose `event_id` is already stored as a `source_event_id` are dropped as replays. If nothing is new, the batch is skipped.
+6. **Rebuild.** Prior events and new events are combined and the history of each impacted account is recomputed, ordered by `event_time, event_id`.
+7. **Write.** If the target does not exist, the rebuilt rows are appended. Otherwise they replace the impacted accounts' rows with `replaceWhere` in a single Delta transaction.
+8. **Audit.** One operational audit record per batch (input rows, new rows, impacted accounts, history rows, current rows, duration).
 
-### Streaming latency and recovery
-
-Target claim:
-
-> Built Spark Structured Streaming pipelines with event-time watermarking and checkpoint recovery, achieving measured 2.50s p50 and 3.73s p95 end-to-end latency across 30 benchmark runs of 20-event workloads, with replay-safe/idempotent Delta processing.
-
-The five-second trigger is a configuration target. **The latency figures above are measured benchmark results, not a fixed performance guarantee.** Run:
-
-```bash
-PYTHONPATH=src python benchmarks/measure_e2e_latency.py --events 20 --trigger "5 seconds" --runs 30
-```
-
-The benchmark reports p50/p95/max event-file-to-Delta-commit latency. Only use the measured result on the resume.
-
-### SCD Type 2 and schema evolution
-
-Target claim:
-
-> Implemented full SCD Type 2 history tracking with effective dating, handling late/out-of-order events and additive schema evolution while quarantining incompatible schema drift.
-
-The test suite covers:
-
-- new account creation
-- attribute changes
-- multiple changes for the same account in one micro-batch
-- late-arriving events inserted into effective history
-- replayed micro-batches
-- additive `customer_segment` schema evolution
-- incompatible critical-field type quarantine
-
-## Reusable framework boundary
-
-The streaming project reuses the strongest common patterns from the Incremental Batch framework:
-
-- configuration and metadata concepts
-- operational control/audit patterns
-- data-quality validation
-- reconciliation
-- idempotent Delta writing
-- per-micro-batch audit metrics
-- structured logging
-
-It does **not** treat the batch control state as a Spark streaming watermark.
-
-```text
-Reusable operational framework
-       │
-       ├── configuration / metadata
-       ├── audit / control
-       ├── DQ
-       ├── reconciliation
-       └── idempotent Delta write
-                    │
-                    ▼
-             Streaming adapter
-                    │
-       ┌────────────┼────────────┐
-       ▼            ▼            ▼
-  checkpoint   event-time     foreachBatch
-                watermark          │
-                                   ▼
-                                SCD2
-```
-
-## Three different state mechanisms
+## State mechanisms
 
 | Mechanism | Purpose |
 |---|---|
 | Spark checkpoint | Streaming progress and restart recovery |
-| `withWatermark()` | Event-time lateness and bounded streaming state |
-| Event ledger | Durable application-level event history keyed by `event_id` |
-
-Keeping these responsibilities separate makes the pipeline easier to reason about and safer to replay.
+| Stream-level `dropDuplicates(event_id)` with `withWatermark` | Drop duplicate events inside the stream |
+| Target table as prior state | Events already stored (`source_event_id`) are skipped on replay, and the rebuild is deterministic, so a replayed batch produces the same result |
 
 ## SCD2 design
 
-The event ledger is merged by `event_id`, so a replayed event is not duplicated. For each affected account, history is rebuilt deterministically from the durable ledger ordered by `event_time, event_id`. Only state-changing events create SCD2 versions.
+- A new version is created when `account_status`, `account_tier` or `branch_region` changes (null-safe comparison) or when an account's first event arrives. Events that change nothing do not create versions.
+- Versions are ordered by `event_time, event_id`. `effective_to` is the next version's `event_time`; the latest version has `effective_to = null` and `is_current = true`.
+- `version_id` is `sha2(account_id || event_id)`.
+- `DELETE` events take part in the ordering and in change detection but are not written as versions. The version before a `DELETE` is closed and is not current.
+- Events within a batch that touch the same account are all applied, so several changes to one account in one micro-batch produce several versions and exactly one current row.
+- Late events for an account are placed in the correct position because the account's history is rebuilt from its stored versions plus the new events.
 
-This specifically protects the difficult case where one account changes several times inside the same Spark micro-batch:
+Target columns: `version_id, account_id, source_event_id, event_time, account_status, account_tier, branch_region, effective_from, effective_to, is_current`.
 
-```text
-10:00 ACTIVE / STANDARD
-10:01 SUSPENDED / STANDARD
-10:02 ACTIVE / PREMIUM
-```
+## Data quality and quarantine
 
-The result contains three historical versions and exactly one `is_current = true` row.
+- Contract violations and critical-type drift are written to the dead-letter Delta table (`mergeSchema=true`), with a `quarantine_reason`.
+- The stream reads with a fixed schema (`CDC_EVENT_SCHEMA`), so mistyped values are handled by the reader and the contract checks rather than by a schema change at the source.
+- `customer_segment` is accepted as an optional field in the event contract.
 
-A late event that arrives within the configured watermark is inserted into its correct effective-date position and causes subsequent versions to be re-derived.
+## Execution modes
 
-## Schema evolution
+| Environment | Trigger | Why |
+|---|---|---|
+| Local | `processingTime` (default `5 seconds`) | Continuous streaming for development and benchmarking |
+| Databricks | `availableNow` | Selected automatically when `DATABRICKS_RUNTIME_VERSION` is set. Serverless compute supports this incremental trigger, so the job drains the available files and exits |
 
-Additive banking attributes are supported through Delta `mergeSchema=true`. `customer_segment` is included as an optional evolved field. The reusable schema guard quarantines incompatible types for critical columns.
-
-For Databricks deployments where automatic source-schema discovery is required, the same processing layer can be connected to Auto Loader; the local implementation keeps the source deterministic for testing.
+On Databricks the job is therefore run on a schedule or by ADF, not as an always-on query, and end-to-end latency includes the schedule interval.
 
 ## Local run
-
-Create a virtual environment and install dependencies:
 
 ```bash
 python -m venv .venv
@@ -172,67 +111,107 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Terminal 1 — start the event simulator:
+Terminal 1, event simulator:
 
 ```bash
 PYTHONPATH=src python src/data_generator/event_stream_simulator.py \
-  --events-per-second 5 \
-  --late-event-rate 0.10 \
-  --duration-seconds 60
+  --events-per-second 5 --late-event-rate 0.10 --duration-seconds 60
 ```
 
-Terminal 2 — start the streaming query:
+Terminal 2, streaming query:
 
 ```bash
 PYTHONPATH=src python src/jobs/run_streaming_job.py
 ```
 
-Run tests:
+Tests:
 
 ```bash
 PYTHONPATH=src pytest -v
 ```
 
-Run the end-to-end latency benchmark separately (do not treat the pytest suite as the performance benchmark):
+## Databricks deployment
 
-```bash
-PYTHONPATH=src python benchmarks/measure_e2e_latency.py --events 20 --trigger "5 seconds" --runs 30
-```
+`notebooks/01_streaming_scd2_job.py` is a thin wrapper over the same `src/` modules. It reads these widgets and creates the Volume directories:
 
-The benchmark reports the measured p50/p95/max event-file-to-Delta-commit latency. The resume latency number must come from this output.
+| Widget | Default |
+|---|---|
+| `stream_source_path` | `/Volumes/workspace/default/streaming_scd2/landing` |
+| `target_table_path` | `/Volumes/workspace/default/streaming_scd2/account_state_scd2` |
+| `checkpoint_path` | `/Volumes/workspace/default/streaming_scd2/checkpoint` |
+| `dead_letter_path` | `/Volumes/workspace/default/streaming_scd2/quarantine` |
+| `watermark_duration` | `10 minutes` |
 
-## Databricks / Unity Catalog deployment
+Notes for serverless / Spark Connect:
 
-The notebook is intentionally thin and imports the same tested `src/pipeline` modules. It uses the active Databricks SparkSession and Unity Catalog Volume paths. The Databricks runtime supplies Spark and Delta; the notebook does not install the local `delta-spark` wheel.
+- Set `spark.sql.shuffle.partitions` explicitly (the benchmarks used `4`). The default of 200 created 200 state-store instances per batch and added about 13 seconds per batch.
+- `DataFrame.cache()` / `persist()` are not reliably supported, so the code avoids them.
+- Tables are Delta paths inside a Unity Catalog Volume. Unity Catalog grants therefore apply at the Volume level; table-level grants and column masks require registering UC tables (see the roadmap).
 
-Default example paths:
+ADF (`adf/`) is used to start and monitor the Databricks Job (`databricks_job_definition.json`, `pipeline_start_streaming_job.json`). The Databricks Job owns retry behavior.
 
-```text
-/Volumes/main/default/streaming_scd2/landing
-/Volumes/main/default/streaming_scd2/account_state_scd2
-/Volumes/main/default/streaming_scd2/account_event_ledger
-/Volumes/main/default/streaming_scd2/checkpoint
-/Volumes/main/default/streaming_scd2/quarantine
-```
+## Measured performance
 
-Databricks Jobs owns restart/retry of the long-running streaming process. ADF is used as an orchestration/monitoring layer rather than as the streaming engine.
+Measured results only. Details, run conditions and raw output are in `benchmarks/`.
+
+**Local (WSL, native filesystem).** `measure_e2e_latency.py`: 30 runs, 20 events per run, 5-second trigger, file write to first committed micro-batch, each run in a fresh session and an empty target.
+
+| Metric | Result |
+|---|---:|
+| p50 | 2.50 s |
+| p95 | 3.73 s |
+| Min / average / max | 1.93 s / 2.88 s / 12.70 s |
+
+**Databricks Free Edition (serverless).** Per-batch SCD2 processing time from the operational audit log, 20 events per batch, `shuffle.partitions=4`: mean about 9 s (range 7.9 to 11.5 s over 5 batches). This excludes query start-up and the schedule interval.
+
+How to read these numbers:
+
+- The local run is a cold-start burst into an empty target. It exercises the append path only, not history rebuilds, state changes or late events, so it is not a steady-state latency.
+- The local figure contains the wait for the next trigger and first-batch overhead. It is not the same quantity as the Databricks per-batch processing time.
+- The benchmark script runs locally only. On Databricks the `availableNow` trigger ends the query before the benchmark can write its file.
+
+## Known limitations
+
+These describe the current code, not intended behavior. Remove an item when it is fixed and covered by a test.
+
+1. **History is rebuilt from the target table only.** The target stores state-changing versions, not every event. A late event that arrives after a non-changing event, or around a `DELETE`, can therefore produce a wrong current state or lose the deleted interval. A durable event ledger (every event, including `DELETE`) would remove this; an earlier version of the project had one, and it was removed to reduce Delta transactions.
+2. **Stream-level de-duplication runs before validation.** `dropDuplicates(event_id)` happens before quarantine, so rows with a null `event_id` collapse into one, and a corrected resend of a quarantined event can be dropped as a duplicate. The watermark only bounds state if the de-duplication key includes the event-time column; with `event_id` alone, state growth should be checked in `lastProgress`.
+3. **Quarantine writes are plain appends.** A replayed batch can append the same rejected rows twice.
+4. **Schema-drift detection is limited on the streaming path.** The stream reads with a fixed schema, so the type check in `schema_evolution.py` only fires for DataFrames that already carry a different schema. The CDC contract's null and value checks are the effective gate.
+5. **`customer_segment` is not propagated to the SCD2 target.** It is accepted in the event contract but is not selected into the rebuilt history.
+6. **Source is files.** The event source is a JSON landing folder, not Kafka or Event Hubs. The processing layer is source-agnostic, but the ingest function would change.
+7. **Local and Databricks entrypoints are separate.** The notebook rebuilds the stream definition instead of calling `build_and_start_stream`, and the trigger is selected by an environment variable.
+8. **Single writer.** The design assumes one running writer per target.
+
+## Roadmap
+
+- Restore a durable event ledger (one idempotent `MERGE` by `event_id`) and rebuild history from it.
+- Move validation before stream-level de-duplication, or replace it with `dropDuplicatesWithinWatermark`.
+- Make quarantine writes idempotent (`txnAppId` / `txnVersion`) and write once per batch.
+- Parameterize the trigger and call `build_and_start_stream` from the notebook.
+- Register the SCD2 target and quarantine as Unity Catalog tables.
+- Add a Kafka or Event Hubs source option.
+- Extend the benchmark with pre-loaded history, state changes and late events.
 
 ## Project structure
 
-```text
+```
 src/
+  cdc/
+    event_contract.py          # CDC event schema, validation and quarantine
   data_generator/
     event_stream_simulator.py
   jobs/
     run_streaming_job.py
   pipeline/
     config.py
-    audit.py
     logger.py
-    scd2_merge.py
-    schema_evolution.py
+    scd2_merge.py              # apply_scd2_batch, history rebuild
+    schema_evolution.py        # critical-type guard
     spark_session.py
-    streaming_job.py
+    streaming_job.py           # build_and_start_stream, micro-batch handler
+  streaming_framework/
+    audit.py  checkpoint.py  context.py  metrics.py
 benchmarks/
   measure_e2e_latency.py
 tests/
@@ -251,12 +230,10 @@ docs/
 
 ## Stack
 
-Python · PySpark · Spark Structured Streaming · Delta Lake · pytest · Azure Databricks · ADF · Unity Catalog Volumes
+Python, PySpark, Spark Structured Streaming, Delta Lake, pytest, Azure Databricks, Azure Data Factory, Unity Catalog Volumes.
 
----
+## Companion projects
 
-Companion projects:
-
-- `increment_batch_pipeline` — metadata-driven incremental snapshot processing
-- `micro-batch-pipeline` — idempotent batch/replay/recovery processing
-- this repository — continuous Structured Streaming + banking SCD Type 2
+- `increment_batch_pipeline`: metadata-driven incremental snapshot processing
+- `micro-batch-pipeline`: idempotent batch, replay and recovery processing
+- this repository: Structured Streaming with banking SCD Type 2
